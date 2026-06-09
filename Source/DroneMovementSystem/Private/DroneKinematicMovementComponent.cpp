@@ -3,10 +3,66 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Kismet/GameplayStatics.h"
+// 新增：引入电影相机组件头文件
+#include "CineCameraComponent.h"
 
 UDroneKinematicMovementComponent::UDroneKinematicMovementComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
+}
+
+void UDroneKinematicMovementComponent::UpdateCameraFocalLength(float LeftTrigger, float RightTrigger,
+                                                               float MinFocalLength, float MaxFocalLength,
+                                                               float DeltaTime)
+{
+	// 确保缓存的物理目标相机有效
+	if (!CachedCameraActor.IsValid() || DeltaTime <= 0.0f)
+	{
+		return;
+	}
+
+	// 自动在绑定的 CameraActor 中寻找电影相机组件 (CineCameraComponent)
+	UCineCameraComponent* CineCamComp = CachedCameraActor->FindComponentByClass<UCineCameraComponent>();
+	if (!CineCamComp)
+	{
+		return;
+	}
+
+	// 计算复合变焦输入：右扳机放大，左扳机缩小
+	float ZoomDirection = RightTrigger - LeftTrigger;
+
+	if (!FMath::IsNearlyZero(ZoomDirection))
+	{
+		// ✨ ✨ ✨ 核心同步：每次都直接从相机组件读取当前的“最真实焦距”
+		// 这样即使你在细节面板手动改了焦距，手柄变焦也会立刻基于你手动修改后的值进行推拉！
+		float LiveFocalLength = CineCamComp->CurrentFocalLength;
+
+		// 基于当前的实际焦距和时间步长计算新焦距
+		float NewFocalLength = LiveFocalLength + (ZoomDirection * FocalLengthSpeed * DeltaTime);
+
+		// 严格限制在蓝图传入的 min 到 max 区间内
+		NewFocalLength = FMath::Clamp(NewFocalLength, MinFocalLength, MaxFocalLength);
+
+		// 只有当新计算的焦距和当前实际焦距不相等时，才执行刷新
+		if (!FMath::IsNearlyEqual(NewFocalLength, LiveFocalLength, 0.01f))
+		{
+			// 1. 将新焦距应用给相机组件
+			CineCamComp->SetCurrentFocalLength(NewFocalLength);
+
+			// 2. 在非 PIE（编辑器模式）下，精准定向触发相机的画幅刷新函数
+			UFunction* UpdateWidgetFunc = CachedCameraActor->FindFunction(TEXT("UpdateWidgetScale"));
+			if (UpdateWidgetFunc)
+			{
+				// 直接呼叫相机的 UpdateWidgetScale 函数，画幅立刻发生推拉变换
+				CachedCameraActor->ProcessEvent(UpdateWidgetFunc, nullptr);
+			}
+			else
+			{
+				// 保底方案：如果没有找到该函数，则刷新构造脚本
+				CachedCameraActor->RerunConstructionScripts();
+			}
+		}
+	}
 }
 
 void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, float ForwardInput, float YawInput,
@@ -29,25 +85,20 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 	}
 
 	// 3. 物理位移控制 (水平合运动 与 垂直独立运动解耦)
-	// 提取当前航向（忽略Pitch/Roll干扰），建立专用于速度积分的水平本地坐标系
 	FRotator HeadingRotation = FRotator(0.0f, Owner->GetActorRotation().Yaw, 0.0f);
 	FVector WorldHorizontalVel = FVector(Velocity.X, Velocity.Y, 0.0f);
 	FVector LocalHorizontalVel = HeadingRotation.UnrotateVector(WorldHorizontalVel);
 
-	// --- 水平复合运动物理积分 (前后与左右平移在此处合并演算) ---
+	// --- 水平复合运动物理积分 ---
 	FVector HorizontalInput = FVector(ForwardInput, RightInput, 0.0f);
 	if (!HorizontalInput.IsNearlyZero())
 	{
-		// 限制输入向量模长不超过 1.0f，防止复合斜向输入导致移动过快
 		HorizontalInput = HorizontalInput.GetClampedToMaxSize(1.0f);
-
 		LocalHorizontalVel += HorizontalInput * HorizontalAcceleration * DeltaTime;
-		// 统一限制最大水平速度
 		LocalHorizontalVel = LocalHorizontalVel.GetClampedToMaxSize(MaxHorizontalSpeed);
 	}
 	else
 	{
-		// 平面矢量急停与平滑刹车（避免低帧率下单独轴向清零导致的超调抖动）
 		float BrakeAmount = HorizontalBrakingDeceleration * DeltaTime;
 		if (LocalHorizontalVel.SizeSquared() <= BrakeAmount * BrakeAmount)
 		{
@@ -59,10 +110,9 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 		}
 	}
 
-	// 将演算完毕的本地水平速度重新转回世界坐标系
 	WorldHorizontalVel = HeadingRotation.RotateVector(LocalHorizontalVel);
 
-	// --- 垂直轴向物理积分 (Z轴依然保持解耦) ---
+	// --- 垂直轴向物理积分 ---
 	float CurrentVerticalVel = Velocity.Z;
 	if (!FMath::IsNearlyZero(UpInput))
 	{
@@ -82,11 +132,10 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 		}
 	}
 
-	// 合成最终物理速度并应用位移
 	Velocity = FVector(WorldHorizontalVel.X, WorldHorizontalVel.Y, CurrentVerticalVel);
 	Owner->SetActorLocation(Owner->GetActorLocation() + Velocity * DeltaTime, true);
 
-	// 4. 机身视觉倾斜模拟 (保持对标准输入的线性响应)
+	// 4. 机身视觉倾斜模拟
 	CurrentPitch = FMath::FInterpTo(CurrentPitch, -ForwardInput * MaxTiltAngle, DeltaTime, TiltDamping);
 	CurrentRoll = FMath::FInterpTo(CurrentRoll, RightInput * MaxTiltAngle, DeltaTime, TiltDamping);
 	if (CachedBodyMesh)

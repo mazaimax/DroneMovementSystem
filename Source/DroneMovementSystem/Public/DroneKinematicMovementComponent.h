@@ -17,8 +17,17 @@ public:
 
 	/** 供蓝图调用的核心运动更新函数 */
 	UFUNCTION(BlueprintCallable, Category = "Drone Movement")
-	void UpdateEditorMovement(float RightInput, float ForwardInput, float YawInput, float PitchInput, float UpInput,
-	                          float DeltaTime);
+	void UpdateEditorMovement(float RightInput, float ForwardInput, float YawInput, float PitchInput, float UpInput, float DeltaTime);
+
+	/** * 新增：供蓝图调用的线性扳机相机焦距（Zoom）控制函数
+	 * @param LeftTrigger  左扳机输入值 (0.0 ~ 1.0) -> 用于缩小焦距 (Zoom Out)
+	 * @param RightTrigger 右扳机输入值 (0.0 ~ 1.0) -> 用于放大焦距 (Zoom In)
+	 * @param MinFocalLength 限制的最小焦距 (例如 12.0)
+	 * @param MaxFocalLength 限制的最大焦距 (例如 85.0)
+	 * @param DeltaTime    每帧时间平滑步长
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Drone|Camera")
+	void UpdateCameraFocalLength(float LeftTrigger, float RightTrigger, float MinFocalLength, float MaxFocalLength, float DeltaTime);
 
 	// =============================================================================
 	// --- 无人机物理与运动控制参数 ---
@@ -40,6 +49,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "最大水平速度"))
 	float MaxHorizontalSpeed = 1600.0f;
 
+	/** 无人机最大垂直升降速度（单位：厘米/秒） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "最大垂直速度"))
+	float MaxVerticalSpeed = 1000.0f;
+
 	/** 水平移动（平面矢量）的运动加速度（单位：厘米/秒²） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "水平移动加速度"))
 	float HorizontalAcceleration = 2500.0f;
@@ -47,10 +60,6 @@ public:
 	/** 水平释放输入时的刹车减速度（单位：厘米/秒²） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "水平刹车减速度"))
 	float HorizontalBrakingDeceleration = 5000.0f;
-
-	/** 无人机最大垂直升降速度（单位：厘米/秒） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "最大垂直速度"))
-	float MaxVerticalSpeed = 1000.0f;
 
 	/** 垂直升降的运动加速度（单位：厘米/秒²） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Physics", meta = (DisplayName = "垂直升降加速度"))
@@ -73,6 +82,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Camera", meta = (DisplayName = "云台旋转速度"))
 	float GimbalRotationSpeed = 120.0f;
 
+	/** 新增：焦距变化速度（单位：毫米/秒）。数值越大，按压扳机时变焦越快 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Camera", meta = (DisplayName = "焦距变焦速度"))
+	float FocalLengthSpeed = 45.0f;
+
 	/** 用于识别和绑定外部目标相机 Actor 的 FName 标签 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Camera", meta = (DisplayName = "相机Actor标签"))
 	FName CameraActorTag = FName(TEXT("vpCam"));
@@ -86,6 +99,9 @@ private:
 	float CurrentRoll = 0.0f;
 	float CurrentPitch = 0.0f;
 	float CurrentGimbalPitch = 0.0f;
+	
+	// 新增：内部当前焦距状态缓存（-1表示未初始化）
+	float CurrentFocalLength = -1.0f;
 
 	// 外部相机附着状态流转变量
 	bool bCameraAttached = false;
