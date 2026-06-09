@@ -18,7 +18,7 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 		return;
 	}
 
-	// 1. 运行组件缓存捕获（首次或失效时触发检索）
+	// 1. 运行组件缓存捕获
 	CacheTargetComponents(Owner, DeltaTime);
 
 	// 2. 无人机航向旋转 (Yaw)
@@ -28,32 +28,65 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 		Owner->AddActorLocalRotation(FRotator(0.0f, YawInput * YawSpeed * DeltaTime, 0.0f));
 	}
 
-	// 3. 物理位移控制 (前、后、左、右、上、下)
-	FVector ForwardVec = Owner->GetActorForwardVector();
-	FVector RightVec = Owner->GetActorRightVector();
-	FVector HorizontalInput = (ForwardVec * ForwardInput) + (RightVec * RightInput);
-	HorizontalInput = HorizontalInput.GetClampedToMaxSize(1.0f);
-	FVector HorizontalVel = FVector(Velocity.X, Velocity.Y, 0.f);
+	// 3. 物理位移控制 (水平合运动 与 垂直独立运动解耦)
+	// 提取当前航向（忽略Pitch/Roll干扰），建立专用于速度积分的水平本地坐标系
+	FRotator HeadingRotation = FRotator(0.0f, Owner->GetActorRotation().Yaw, 0.0f);
+	FVector WorldHorizontalVel = FVector(Velocity.X, Velocity.Y, 0.0f);
+	FVector LocalHorizontalVel = HeadingRotation.UnrotateVector(WorldHorizontalVel);
 
+	// --- 水平复合运动物理积分 (前后与左右平移在此处合并演算) ---
+	FVector HorizontalInput = FVector(ForwardInput, RightInput, 0.0f);
 	if (!HorizontalInput.IsNearlyZero())
 	{
-		HorizontalVel += HorizontalInput * TiltAcceleration * DeltaTime;
-		HorizontalVel = HorizontalVel.GetClampedToMaxSize(BaseMoveSpeed);
+		// 限制输入向量模长不超过 1.0f，防止复合斜向输入导致移动过快
+		HorizontalInput = HorizontalInput.GetClampedToMaxSize(1.0f);
+
+		LocalHorizontalVel += HorizontalInput * HorizontalAcceleration * DeltaTime;
+		// 统一限制最大水平速度
+		LocalHorizontalVel = LocalHorizontalVel.GetClampedToMaxSize(MaxHorizontalSpeed);
 	}
 	else
 	{
-		FVector BrakingDir = -HorizontalVel.GetSafeNormal();
-		HorizontalVel += BrakingDir * BrakingDeceleration * DeltaTime;
-		if (HorizontalVel.SizeSquared() < 100.f)
+		// 平面矢量急停与平滑刹车（避免低帧率下单独轴向清零导致的超调抖动）
+		float BrakeAmount = HorizontalBrakingDeceleration * DeltaTime;
+		if (LocalHorizontalVel.SizeSquared() <= BrakeAmount * BrakeAmount)
 		{
-			HorizontalVel = FVector::ZeroVector;
+			LocalHorizontalVel = FVector::ZeroVector;
+		}
+		else
+		{
+			LocalHorizontalVel -= LocalHorizontalVel.GetSafeNormal() * BrakeAmount;
 		}
 	}
-	float VerticalVel = UpInput * (BaseMoveSpeed * VerticalSpeedMultiplier * 0.5f);
-	Velocity = FVector(HorizontalVel.X, HorizontalVel.Y, VerticalVel);
+
+	// 将演算完毕的本地水平速度重新转回世界坐标系
+	WorldHorizontalVel = HeadingRotation.RotateVector(LocalHorizontalVel);
+
+	// --- 垂直轴向物理积分 (Z轴依然保持解耦) ---
+	float CurrentVerticalVel = Velocity.Z;
+	if (!FMath::IsNearlyZero(UpInput))
+	{
+		CurrentVerticalVel += UpInput * VerticalAcceleration * DeltaTime;
+		CurrentVerticalVel = FMath::Clamp(CurrentVerticalVel, -MaxVerticalSpeed, MaxVerticalSpeed);
+	}
+	else
+	{
+		float BrakeAmount = VerticalBrakingDeceleration * DeltaTime;
+		if (FMath::Abs(CurrentVerticalVel) <= BrakeAmount)
+		{
+			CurrentVerticalVel = 0.0f;
+		}
+		else
+		{
+			CurrentVerticalVel -= FMath::Sign(CurrentVerticalVel) * BrakeAmount;
+		}
+	}
+
+	// 合成最终物理速度并应用位移
+	Velocity = FVector(WorldHorizontalVel.X, WorldHorizontalVel.Y, CurrentVerticalVel);
 	Owner->SetActorLocation(Owner->GetActorLocation() + Velocity * DeltaTime, true);
 
-	// 4. 机身视觉倾斜模拟 (倾斜并不改变移动方向，仅作为飞行物理姿态的视觉反馈)
+	// 4. 机身视觉倾斜模拟 (保持对标准输入的线性响应)
 	CurrentPitch = FMath::FInterpTo(CurrentPitch, -ForwardInput * MaxTiltAngle, DeltaTime, TiltDamping);
 	CurrentRoll = FMath::FInterpTo(CurrentRoll, RightInput * MaxTiltAngle, DeltaTime, TiltDamping);
 	if (CachedBodyMesh)
@@ -66,31 +99,25 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 	                                  45.0f);
 
 	// 6. 核心云台控制逻辑
-	// 【注意】：基于云台资产与机身平级挂载在 Root 节点下的特殊层级，FRotator 的参数轴向为 (Pitch, Yaw, Roll)
 	if (bEnableCameraStabilizer)
 	{
-		// 【自稳机制】：由于 Root 节点本身永远保持水平，此处将云台相对旋转置零即可天然对齐世界水平地平线
 		if (CachedCameraRollMesh)
 		{
 			CachedCameraRollMesh->SetRelativeRotation(FRotator::ZeroRotator);
 		}
 		if (CachedCameraPitchMesh)
 		{
-			// 第一个参数严格对应 Pitch 轴，只保留操作员的手动俯仰控制
 			CachedCameraPitchMesh->SetRelativeRotation(FRotator(CurrentGimbalPitch, 0.0f, 0.0f));
 		}
 	}
 	else
 	{
-		// 【随动机制（FPV第一人称）】：由于未挂载在机身下，必须主动将飞机的物理倾斜角补偿给云台网格体
 		if (CachedCameraRollMesh)
 		{
-			// 第三个参数严格对应 Roll 轴，强行将机身 Roll 同步给云台横滚轴
 			CachedCameraRollMesh->SetRelativeRotation(FRotator(0.0f, 0.0f, CurrentRoll));
 		}
 		if (CachedCameraPitchMesh)
 		{
-			// 第一个参数严格对应 Pitch 轴，将机身 Pitch 与操作员的手动俯仰输入完美叠加
 			CachedCameraPitchMesh->SetRelativeRotation(FRotator(CurrentPitch + CurrentGimbalPitch, 0.0f, 0.0f));
 		}
 	}
@@ -98,7 +125,6 @@ void UDroneKinematicMovementComponent::UpdateEditorMovement(float RightInput, fl
 
 void UDroneKinematicMovementComponent::CacheTargetComponents(AActor* Owner, float DeltaTime)
 {
-	// 动态检索并缓存无人机的各个物理/视觉网格体组件
 	if (!CachedBodyMesh || !CachedCameraRollMesh || !CachedCameraPitchMesh)
 	{
 		TArray<UActorComponent*> Components;
@@ -127,7 +153,6 @@ void UDroneKinematicMovementComponent::CacheTargetComponents(AActor* Owner, floa
 		}
 	}
 
-	// 外部物理相机的动态生命周期与附着管理
 	if (bCameraAttached)
 	{
 		bool bIsValidAttachment = CachedCameraActor.IsValid() &&
@@ -168,7 +193,7 @@ void UDroneKinematicMovementComponent::CacheTargetComponents(AActor* Owner, floa
 				}
 				else
 				{
-					SearchCooldownTimer = 1.0f; // 没找到则进入 1 秒冷却，避免每帧检索损耗性能
+					SearchCooldownTimer = 1.0f;
 				}
 			}
 		}
